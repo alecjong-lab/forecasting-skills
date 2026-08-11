@@ -28,6 +28,8 @@ _COMPARISONS = {
     "le": operator.le,
 }
 
+_COMPARISON_SYMBOLS = {"gt": ">", "ge": "≥", "lt": "<", "le": "≤"}
+
 
 def _normalize_args(args):
     # Normalize provenance args before stamping so reordered or duplicated
@@ -121,7 +123,10 @@ def exceedance_probability(ds, input_paths, variable, dim, threshold, comparison
         condition_met = comp(da, threshold)
         pct = condition_met.sum(dim=dim) / da.sizes[dim] * 100
         src_units = da.attrs.get("units", "")
-        label = f"probability {var} {comparison} {threshold}{src_units}"
+        unit_suffix = f" {src_units}" if src_units and src_units != "1" else ""
+        described = da.attrs.get("long_name", var)
+        symbol = _COMPARISON_SYMBOLS[comparison]
+        label = f"P({described}) {symbol} {threshold}{unit_suffix}"
         # Attrs are rebuilt from scratch, NOT carried over from the source
         # variable: the source's standard_name/long_name describe the input
         # physical quantity, not this derived percentage, and neither
