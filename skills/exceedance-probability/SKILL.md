@@ -71,10 +71,16 @@ where `--input` and `--output` resolve to the same path.
 Each selected variable becomes the percentage (0-100) of `--dim` entries
 satisfying the comparison, with `--dim` collapsed. Output attrs are rebuilt
 from scratch rather than carried over from the source variable: `units` is
-set to `%`, and `long_name`/`GRIB_name` are both set to a descriptive label
-built from the comparison (e.g. `"probability tp ge 28mm"`) — `long_name` is
-set explicitly because `plot`'s colorbar-label resolution checks it before
-`GRIB_name`. No `standard_name` is set: the source variable's `standard_name`
+set to `%`, and `long_name`/`GRIB_name` are both set to a compact descriptive
+label using the source's own `long_name` (falling back to the variable name)
+and a comparison symbol, e.g. `"P(tp) ≥ 28 mm"`, or `"P(precip spell (< 1.0
+mm)) ≥ 3.0"` when chained after `spell-length` — the source's `units` are
+omitted from the label when dimensionless, i.e. `units == "1"`. Inheriting
+the source `long_name` keeps context from an upstream derived quantity (e.g.
+a spell length) visible in the final label instead of collapsing back to the
+bare variable name. `long_name` is set explicitly because `plot`'s
+colorbar-label resolution checks it before `GRIB_name`. No `standard_name` is
+set: the source variable's `standard_name`
 (e.g. `precipitation_amount`) describes the input physical quantity, not the
 derived percentage, and CF has no `standard_name` for "probability of
 exceeding a threshold" to verify against. The collapsed dim disappears from
