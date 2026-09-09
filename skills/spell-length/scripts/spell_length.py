@@ -1,18 +1,17 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "weather-skills-core @ git+https://github.com/rhiza-research/weather-skills-core",
-#   "cf-xarray",
+#   "weather-skills-core @ git+https://github.com/rhiza-research/weather-skills-core@main",
 #   "cftime>=1.6",
-#   "xarray",
 #   "numpy",
+#   "xarray",
 # ]
 # ///
 """Max consecutive-run length along a time-like dim satisfying a threshold comparison.
 
 For each selected data variable, computes the longest run of consecutive
-entries along the time dim (``time`` or ``step``) satisfying
-``value <comparison> threshold`` — e.g. a dry-spell length with
+entries along the time dim (``time``, or a lead-time dim such as ``step``)
+satisfying ``value <comparison> threshold`` — e.g. a dry-spell length with
 ``--comparison lt`` on precipitation, or a wet-spell / heatwave length with
 ``--comparison ge``. Data variables that don't carry the time dim pass
 through untouched.
@@ -21,7 +20,12 @@ through untouched.
 import operator
 import sys
 
-from weather_skills_core import UsageError, WroteSummary, weather_skill
+from weather_skills_core import Dataset, UsageError, weather_skill
+from weather_skills_core.standard_dataset import (
+    ALIASES,
+    PREDICTION_TIMEDELTA,
+    detect_time_dim,
+)
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
 _SKILL_VERSION = "0.1.0"
@@ -65,116 +69,78 @@ def _max_consecutive_run_nd(block, threshold, comp):
     return max_run
 
 
-def _normalize_args(args):
-    # Normalize provenance args before stamping so reordered or duplicated
-    # --variable flags don't cause spurious cache misses; --threshold and
-    # --comparison are already scalars and need no normalization.
-    if args.get("variable") is not None:
-        args["variable"] = sorted(set(args["variable"]))
-    return args
+def _resolve_time_dim(ds, override):
+    """Explicit --time-dim wins; else the ontology's time dim; else a
+    lead-time dim (e.g. `step`, aliased to `prediction_timedelta`)."""
+    if override:
+        if override not in ds.dims:
+            raise UsageError(f"--time-dim '{override}' not in dims {list(ds.dims)}")
+        return override
+    try:
+        return detect_time_dim(ds)
+    except UsageError:
+        pass
+    lead = next((d for d in ds.dims if ALIASES.get(d) == PREDICTION_TIMEDELTA), None)
+    if lead is not None:
+        print(
+            f"Note: no time dim found; computing spell length over lead-time "
+            f"dim '{lead}' instead. Pass --time-dim to override.",
+            file=sys.stderr,
+        )
+        return lead
+    raise UsageError(
+        f"no time/lead-time dim identified in {list(ds.dims)}. Pass --time-dim to override."
+    )
 
 
 @weather_skill(
-    "spell-length",
-    _SKILL_VERSION,
-    input_type="any",
-    # Collapsing the time dim changes which canonical envelope shape the
-    # output falls into (e.g. a forecast envelope loses its `step` axis), so
-    # the union declares every zarr envelope shape; the returned dataset's
-    # detected shape is validated against it before the write.
-    output_type=("gridded", "forecast", "station"),
-    input_paths=True,
-    variable={
-        "mode": "repeat",
-        "help": "Restrict the computation to this data variable. Repeatable. "
-        "Each selected variable must carry the time dim. Default (unset): "
-        "every data variable carrying the time dim.",
-    },
-    time_dim=True,
-    extra_args={
-        "threshold": {
-            "required": True,
-            "type": float,
-            "help": "Value to compare each time-step against, in the variable's own units.",
-        },
-        "comparison": {
-            "required": True,
-            "choices": ["gt", "ge", "lt", "le"],
-            "help": "Comparison applied as value <op> threshold, e.g. 'lt' for a dry-spell "
-            "(below-threshold) run, 'ge' for a wet-spell (at-or-above-threshold) run.",
-        },
-    },
-    normalize_args=_normalize_args,
+    name="spell-length",
+    version=_SKILL_VERSION,
 )
-def spell_length(ds, input_paths, variable, time_dim, threshold, comparison):
+@weather_skill.argument("-i", "--input", type=Dataset("any"), required=True)
+@weather_skill.argument(
+    "--variable",
+    "-v",
+    action="append",
+    help="Restrict the computation to this data variable. Repeatable. "
+    "Each selected variable must carry the time dim. Default (unset): "
+    "every data variable carrying the time dim.",
+)
+@weather_skill.argument(
+    "--threshold",
+    type=float,
+    required=True,
+    help="Value to compare each time-step against, in the variable's own units.",
+)
+@weather_skill.argument(
+    "--comparison",
+    required=True,
+    choices=["gt", "ge", "lt", "le"],
+    help="Comparison applied as value <op> threshold, e.g. 'lt' for a dry-spell "
+    "(below-threshold) run, 'ge' for a wet-spell (at-or-above-threshold) run.",
+)
+@weather_skill.argument(
+    "--time-dim",
+    default=None,
+    help="Name of the time-like dim when not auto-detectable.",
+)
+def spell_length(ds, variable, threshold, comparison, time_dim, **kwargs):
     """Max consecutive-run length along a time-like dim satisfying a threshold comparison."""
     import numpy as np
     import xarray as xr
 
-    src = input_paths[0]
+    dim = _resolve_time_dim(ds, time_dim)
 
-    # Time-dim detection, mirroring aggregate-temporal's: an explicit
-    # --time-dim override wins; otherwise try the CF "T" axis, preferring a
-    # literal `time` dim, but fall back to `step` (forecast lead time,
-    # timedelta64 - not a CF T axis) when `time` is a size-1 scalar-like
-    # init-date dim alongside a `step` axis.
-    if time_dim:
-        dim = time_dim
-        if dim not in ds.dims:
-            raise UsageError(f"--time-dim '{dim}' not in dims {list(ds.dims)}")
-    else:
-        import cf_xarray  # noqa: F401 — registers the .cf accessor
-
-        try:
-            cf_time = ds.cf["time"].name
-        except KeyError:
-            cf_time = "time" if "time" in ds.dims else None
-        if cf_time is not None and cf_time in ds.dims:
-            if ds.sizes[cf_time] == 1 and "step" in ds.dims:
-                print(
-                    f"Note: time dim '{cf_time}' has size 1 alongside a "
-                    f"'step' dim; computing spell length over step instead. "
-                    f"Pass --time-dim {cf_time} to override.",
-                    file=sys.stderr,
-                )
-                dim = "step"
-            else:
-                if "step" in ds.dims:
-                    print(
-                        f"Note: both '{cf_time}' and 'step' dims are present; "
-                        f"computing spell length over {cf_time}. Pass "
-                        f"--time-dim step to use the forecast lead axis instead.",
-                        file=sys.stderr,
-                    )
-                dim = cf_time
-        elif "step" in ds.dims:
-            dim = "step"
-        else:
-            dim = None
-        if dim is None:
-            non_dim_time = cf_time
-            if non_dim_time is None and "time" in ds.coords:
-                non_dim_time = "time"
-            if non_dim_time is not None:
-                raise UsageError(
-                    f"found a '{non_dim_time}' coordinate, but it is "
-                    f"not a dimension of the data (a scalar coordinate has no "
-                    f"axis to scan) and no 'step' dim is present. "
-                    f"Dims: {list(ds.dims)}. Pass --time-dim to override."
-                )
-            raise UsageError(
-                f"no time/step dim identified in {list(ds.dims)}. Pass --time-dim to override."
-            )
-
-    # Variable selection, mirroring `reduce`: explicit --variable names must
-    # be data variables and must each carry the time dim. Default selection
-    # takes every data variable carrying it; the rest pass through untouched.
+    # Variable selection, mirroring `summarize-dim`: explicit --variable names
+    # must be data variables and must each carry the time dim. Default
+    # selection takes every data variable carrying it; the rest pass through
+    # untouched.
     if variable is not None:
         data_vars = list(ds.data_vars)
         invalid = [v for v in variable if v not in ds.data_vars]
         if invalid:
             raise UsageError(
-                f"--variable {invalid} not data variable(s) of {src}. "
+                f"--variable {invalid} not data variable(s) of the input. "
                 f"Valid data variables: {data_vars}"
             )
         selected = list(dict.fromkeys(variable))
@@ -203,6 +169,12 @@ def spell_length(ds, input_paths, variable, time_dim, threshold, comparison):
     out_ds = ds.copy()
     for var in selected:
         da = ds[var]
+        # The decorator opens data-variable inputs as pint quantities; a bare
+        # float threshold can't compare against one inside apply_ufunc, so
+        # drop back to a plain array (this also restores the string `units`
+        # attr for the label).
+        if getattr(da, "pint", None) is not None and da.pint.units is not None:
+            da = da.pint.dequantify()
         result = xr.apply_ufunc(
             _max_consecutive_run_nd,
             da,
@@ -221,16 +193,22 @@ def spell_length(ds, input_paths, variable, time_dim, threshold, comparison):
         # variable: the source's standard_name/long_name describe the input
         # physical quantity, not this derived run-length count, and neither
         # survives the unit change. No standard_name is set — CF has no
-        # entry for "consecutive spell length" to verify against. long_name
-        # is set (not just GRIB_name) because `plot`'s colorbar-label
-        # resolution checks long_name first. units="1" is the CF convention
-        # for a dimensionless count; this equals real days only when the
-        # time dim's cadence is daily — the skill counts entries, not
-        # calendar duration.
+        # entry for "consecutive spell length" to verify against. Both
+        # GRIB_name and long_name are set to the same label because `plot`'s
+        # colorbar-label resolution reads GRIB_name first, falling back to
+        # long_name. units="1" is the CF convention for a dimensionless
+        # count; this equals real days only when the time dim's cadence is
+        # daily — the skill counts entries, not calendar duration.
+        # standard_name is explicitly None, not merely absent: the decorator
+        # heals attrs missing on an output var from the same-named input var
+        # (for skills that only reshape geometry), which would otherwise
+        # silently re-attach the source's physical-quantity standard_name to
+        # this differently-kinded derived count.
         result.attrs = {
             "GRIB_name": label,
             "long_name": label,
             "units": "1",
+            "standard_name": None,
         }
         out_ds[var] = result
 
@@ -240,7 +218,7 @@ def spell_length(ds, input_paths, variable, time_dim, threshold, comparison):
     if dim in out_ds.dims and all(dim not in out_ds[v].dims for v in out_ds.data_vars):
         out_ds = out_ds.drop_dims(dim)
 
-    return out_ds, WroteSummary(f"{out_ds.sizes}", replace=True)
+    return out_ds
 
 
 if __name__ == "__main__":

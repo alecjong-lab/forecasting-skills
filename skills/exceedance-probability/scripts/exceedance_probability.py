@@ -1,22 +1,23 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "weather-skills-core @ git+https://github.com/rhiza-research/weather-skills-core",
+#   "weather-skills-core @ git+https://github.com/rhiza-research/weather-skills-core@main",
 #   "cftime>=1.6",
 # ]
 # ///
 """Compute the percentage of ensemble members exceeding a fixed threshold.
 
 For each selected data variable, computes the percentage of entries along
-``--dim`` (e.g. ``number`` for an ECMWF/GEFS ensemble) satisfying
-``value <comparison> threshold``, per remaining grid cell/step. Data
-variables that don't carry ``--dim`` pass through untouched.
+``--dim`` (e.g. ``number``, aliased to ``member`` in the dim ontology, for an
+ECMWF/GEFS ensemble) satisfying ``value <comparison> threshold``, per
+remaining grid cell/step. Data variables that don't carry ``--dim`` pass
+through untouched.
 """
 
 import operator
 import sys
 
-from weather_skills_core import UsageError, WroteSummary, weather_skill
+from weather_skills_core import Dataset, UsageError, weather_skill
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
 _SKILL_VERSION = "0.1.0"
@@ -31,67 +32,52 @@ _COMPARISONS = {
 _COMPARISON_SYMBOLS = {"gt": ">", "ge": "≥", "lt": "<", "le": "≤"}
 
 
-def _normalize_args(args):
-    # Normalize provenance args before stamping so reordered or duplicated
-    # --variable flags don't cause spurious cache misses; --dim, --threshold,
-    # and --comparison are already scalars and need no normalization.
-    if args.get("variable") is not None:
-        args["variable"] = sorted(set(args["variable"]))
-    return args
-
-
 @weather_skill(
-    "exceedance-probability",
-    _SKILL_VERSION,
-    input_type="any",
-    # The collapsed dim isn't fixed to one envelope shape (forecast `number`
-    # is the ECMWF case, but nothing stops reuse on a station ensemble or
-    # other member-like dim), so the union declares every zarr envelope
-    # shape; the returned dataset's detected shape is validated against it
-    # before the write.
-    output_type=("gridded", "forecast", "station"),
-    input_paths=True,
-    variable={
-        "mode": "repeat",
-        "help": "Restrict the computation to this data variable. Repeatable. "
-        "Each selected variable must carry --dim. Default (unset): every "
-        "data variable carrying --dim.",
-    },
-    extra_args={
-        "dim": {
-            "required": True,
-            "help": "Ensemble/member dimension to compute the percentage over "
-            "(e.g. 'number' for ECMWF/GEFS forecast envelopes).",
-        },
-        "threshold": {
-            "required": True,
-            "type": float,
-            "help": "Value to compare each member against, in the variable's own units.",
-        },
-        "comparison": {
-            "required": True,
-            "choices": ["gt", "ge", "lt", "le"],
-            "help": "Comparison applied as value <op> threshold.",
-        },
-    },
-    normalize_args=_normalize_args,
+    name="exceedance-probability",
+    version=_SKILL_VERSION,
 )
-def exceedance_probability(ds, input_paths, variable, dim, threshold, comparison):
+@weather_skill.argument("-i", "--input", type=Dataset("any"), required=True)
+@weather_skill.argument(
+    "--variable",
+    "-v",
+    action="append",
+    help="Restrict the computation to this data variable. Repeatable. "
+    "Each selected variable must carry --dim. Default (unset): every "
+    "data variable carrying --dim.",
+)
+@weather_skill.argument(
+    "--dim",
+    required=True,
+    help="Ensemble/member dimension to compute the percentage over "
+    "(e.g. 'number', aliased to 'member', for an ECMWF/GEFS ensemble forecast).",
+)
+@weather_skill.argument(
+    "--threshold",
+    type=float,
+    required=True,
+    help="Value to compare each member against, in the variable's own units.",
+)
+@weather_skill.argument(
+    "--comparison",
+    required=True,
+    choices=["gt", "ge", "lt", "le"],
+    help="Comparison applied as value <op> threshold.",
+)
+def exceedance_probability(ds, variable, dim, threshold, comparison, **kwargs):
     """Compute the percentage of ensemble members exceeding a fixed threshold."""
-    src = input_paths[0]
-
     if dim not in ds.dims:
         raise UsageError(f"--dim '{dim}' not in dims {list(ds.dims)}.")
 
-    # Variable selection, mirroring `reduce`: explicit --variable names must
-    # be data variables and must each carry --dim. Default selection takes
-    # every data variable carrying --dim; the rest pass through untouched.
+    # Variable selection, mirroring `summarize-dim`: explicit --variable names
+    # must be data variables and must each carry --dim. Default selection
+    # takes every data variable carrying --dim; the rest pass through
+    # untouched.
     if variable is not None:
         data_vars = list(ds.data_vars)
         invalid = [v for v in variable if v not in ds.data_vars]
         if invalid:
             raise UsageError(
-                f"--variable {invalid} not data variable(s) of {src}. "
+                f"--variable {invalid} not data variable(s) of the input. "
                 f"Valid data variables: {data_vars}"
             )
         selected = list(dict.fromkeys(variable))
@@ -120,6 +106,11 @@ def exceedance_probability(ds, input_paths, variable, dim, threshold, comparison
     out_ds = ds.copy()
     for var in selected:
         da = ds[var]
+        # The decorator opens data-variable inputs as pint quantities; a bare
+        # float threshold can't compare against one, so drop back to a plain
+        # array (this also restores the string `units` attr for the label).
+        if getattr(da, "pint", None) is not None and da.pint.units is not None:
+            da = da.pint.dequantify()
         condition_met = comp(da, threshold)
         pct = condition_met.sum(dim=dim) / da.sizes[dim] * 100
         src_units = da.attrs.get("units", "")
@@ -132,12 +123,19 @@ def exceedance_probability(ds, input_paths, variable, dim, threshold, comparison
         # physical quantity, not this derived percentage, and neither
         # survives the unit change to `%`. No standard_name is set — CF has
         # no entry for "probability of exceeding a threshold" to verify
-        # against. long_name is set (not just GRIB_name) because `plot`'s
-        # colorbar-label resolution checks long_name first.
+        # against. Both GRIB_name and long_name are set to the same label
+        # because `plot`'s colorbar-label resolution reads GRIB_name first,
+        # falling back to long_name. standard_name is explicitly None, not
+        # merely absent: the decorator heals attrs missing on an output var
+        # from the same-named input var (for skills that only reshape
+        # geometry), which would otherwise silently re-attach the source's
+        # physical-quantity standard_name to this differently-kinded derived
+        # percentage.
         pct.attrs = {
             "GRIB_name": label,
             "long_name": label,
             "units": "%",
+            "standard_name": None,
         }
         out_ds[var] = pct
 
@@ -147,7 +145,7 @@ def exceedance_probability(ds, input_paths, variable, dim, threshold, comparison
     if dim in out_ds.dims and all(dim not in out_ds[v].dims for v in out_ds.data_vars):
         out_ds = out_ds.drop_dims(dim)
 
-    return out_ds, WroteSummary(f"{out_ds.sizes}", replace=True)
+    return out_ds
 
 
 if __name__ == "__main__":

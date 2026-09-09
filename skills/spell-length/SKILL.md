@@ -3,9 +3,8 @@ name: spell-length
 description: Compute the longest run of consecutive time-steps satisfying a threshold comparison (e.g. a dry-spell length where precipitation stays below a threshold, or a wet-spell/heatwave length where it stays at or above one). Use whenever a dataset needs a consecutive-run-length statistic along its time/step axis, especially upstream of exceedance-probability to get "likelihood of a spell longer than N".
 license: MIT
 compatibility: Requires Python 3.12 and uv.
-allowed-tools: Bash(uv run --script ${CLAUDE_SKILL_DIR}/scripts/spell_length.py *)
+allowed-tools: Bash(uv run ${CLAUDE_SKILL_DIR}/scripts/spell_length.py *)
 metadata:
-  version: "0.1.0"
   catalog-group: transforms
 ---
 
@@ -13,8 +12,9 @@ metadata:
 
 Source-agnostic consecutive-run-length statistic along the time-like dim.
 For each selected data variable, computes the longest run of consecutive
-entries along `time`/`step` satisfying `value <comparison> threshold`. Data
-variables that don't carry the time dim pass through untouched.
+entries along `time` (or a lead-time dim such as `step`) satisfying
+`value <comparison> threshold`. Data variables that don't carry the time dim
+pass through untouched.
 
 ## When to use
 
@@ -32,18 +32,15 @@ variables that don't carry the time dim pass through untouched.
 ## Usage
 
 ```
-uv run --script ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
+uv run ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
     --input <in.zarr> --output <out.zarr> \
     --threshold FLOAT --comparison gt|ge|lt|le \
     [--variable VAR ...] [--time-dim DIM]
 ```
 
-The output must be a distinct store from the input; the skill rejects a run
-where `--input` and `--output` resolve to the same path.
-
 ### Arguments
-- `--input`, `-i` — input Zarr.
-- `--output`, `-o` — output Zarr (a distinct path from `--input`).
+- `--input`, `-i` — input Zarr (any).
+- `--output`, `-o` — output Zarr.
 - `--threshold` — value to compare each time-step against, in the target
   variable's own units. No unit conversion happens in this skill; use
   `unit-convert` upstream if needed.
@@ -62,13 +59,11 @@ where `--input` and `--output` resolve to the same path.
 
 ### Time-dim detection
 
-Without `--time-dim`, the skill tries the CF "T" axis first (finds wall-clock
-time even when named unusually), preferring a literal `time` dim; but on a
-forecast envelope where `time` is a size-1 scalar init-date coordinate
-alongside a `step` (forecast lead time, `timedelta64`) dim, it computes over
-`step` instead and prints a note. When both a real `time` dim and a `step`
-dim are present, it computes over `time` and prints a note pointing at
-`--time-dim step` as the alternative.
+Without `--time-dim`, the skill first tries the dim ontology's time
+detection (CF "T" axis, then a literal `time` dim). When that finds nothing —
+a classic forecast dataset, where `time` is a scalar init-date coordinate
+rather than a dim — it falls back to whichever dim the ontology aliases to
+the lead-time axis (e.g. `step`) and prints a note naming the dim it picked.
 
 ### NaN handling and units
 
@@ -83,14 +78,19 @@ the skill counts *entries* along the axis, not calendar duration. Output
 attrs are rebuilt from scratch rather than carried over from the source
 variable: the source's `standard_name`/`long_name` describe the input
 physical quantity (e.g. a precipitation rate), not this derived run-length
-count. `long_name`/`GRIB_name` are both set to a compact descriptive label
-using a comparison symbol (e.g. `"precip spell (< 1.0 mm)"`) — kept short
-since `exceedance-probability` commonly chains directly off this output and
-inherits the label as its own described quantity; a longer sentence here
-would compound into an overflowing colorbar label downstream. `long_name` is
-set explicitly because `plot`'s colorbar-label resolution checks it before
-`GRIB_name`. No `standard_name` is set: CF has no entry for "consecutive
-spell length" to verify against.
+count. `long_name`/`GRIB_name` are both set to the same compact descriptive
+label using a comparison symbol (e.g. `"precip spell (< 1.0 millimeter)"`) —
+kept short since `exceedance-probability` commonly chains directly off this
+output and inherits the label as its own described quantity; a longer
+sentence here would compound into an overflowing colorbar label downstream.
+Both `GRIB_name` and `long_name` are set because `plot`'s colorbar-label
+resolution reads `GRIB_name` first, falling back to `long_name`.
+`standard_name` is set to `None` explicitly (not simply omitted): the
+decorator otherwise heals an attr missing on an output variable from the
+same-named input variable, which would silently reattach the source's
+physical-quantity `standard_name` to this differently-kinded derived count —
+and CF has no entry for "consecutive spell length" to verify against
+regardless.
 
 ### Output
 
@@ -102,35 +102,27 @@ pass-through variable stays. Remaining dims (e.g. `number`, `latitude`,
 
 ### Provenance
 
-The output stamps a JSON-encoded `weather_skills_history` attr: the input's chain plus
-an entry for this run, each entry `{skill, version, args, input}` (`version`
-is the value printed by `--help`). Flag values in `args` are recorded under
-underscored names (e.g. a flag `--time-dim` is recorded as `time_dim`);
-translate underscore → hyphen when reconstructing a CLI invocation. Inspect a
-written output's lineage with the `provenance` skill.
-
-Re-running with identical arguments against an unchanged input and an existing
-output is a cheap no-op — reuse the same output path. A cache hit requires the
-same skill `version`, the same flags, the same input name, the same input
-content, and the same upstream history; any modification to the input forces a
-recompute (a renamed-but-unchanged input misses, and a modified same-named
-input misses).
+The output stamps a JSON-encoded `weather_skills_history` attr: the input's
+chain plus an entry for this run, `{skill, version, args, input}` (`version`
+is the value printed by `--help`). Inspect a written output's lineage with
+the `provenance` skill. There is no cache: every run recomputes and rewrites
+`--output`, even against an unchanged input with identical flags.
 
 ## Examples
 
 ```bash
 # Longest dry-spell run per ensemble member (ECMWF S2S forecast, step axis).
-uv run --script ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
+uv run ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
     -i /tmp/ecmwf.zarr -o /tmp/ecmwf_dry_spell.zarr \
     --threshold 1 --comparison lt --variable tp
 ```
 
 ```bash
 # Chained: likelihood of a dry spell longer than 10 days across the ensemble.
-uv run --script ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
+uv run ${CLAUDE_SKILL_DIR}/scripts/spell_length.py \
     -i /tmp/ecmwf.zarr -o /tmp/ecmwf_dry_spell.zarr \
     --threshold 1 --comparison lt --variable tp
-uv run --script ${CLAUDE_SKILL_DIR}/../exceedance-probability/scripts/exceedance_probability.py \
+uv run ${CLAUDE_SKILL_DIR}/../exceedance-probability/scripts/exceedance_probability.py \
     -i /tmp/ecmwf_dry_spell.zarr -o /tmp/ecmwf_dry_spell_p10.zarr \
     --dim number --threshold 10 --comparison ge
 ```
