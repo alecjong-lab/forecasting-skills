@@ -26,6 +26,7 @@ from weather_skills_core.standard_dataset import (
     PREDICTION_TIMEDELTA,
     detect_time_dim,
 )
+from weather_skills_core.units import units_equal
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
 _SKILL_VERSION = "0.1.0"
@@ -186,7 +187,13 @@ def spell_length(ds, variable, threshold, comparison, time_dim, **kwargs):
             output_dtypes=[np.float64],
         )
         src_units = da.attrs.get("units", "")
-        unit_suffix = f" {src_units}" if src_units and src_units != "1" else ""
+        # Dequantify above restores `units` from the pint Unit's own spelling,
+        # which renders a CF dimensionless "1" as "dimensionless" (not "1") —
+        # a literal "!= '1'" check would miss that and leak "dimensionless"
+        # into the label. units_equal compares pint-equivalence instead of
+        # exact spelling, so both spellings of "no unit" are recognized.
+        is_dimensionless = bool(src_units) and units_equal(src_units, "1")
+        unit_suffix = f" {src_units}" if src_units and not is_dimensionless else ""
         symbol = _COMPARISON_SYMBOLS[comparison]
         label = f"{var} spell ({symbol} {threshold}{unit_suffix})"
         # Attrs are rebuilt from scratch, NOT carried over from the source

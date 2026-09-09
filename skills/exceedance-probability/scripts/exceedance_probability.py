@@ -18,6 +18,7 @@ import operator
 import sys
 
 from weather_skills_core import Dataset, UsageError, weather_skill
+from weather_skills_core.units import units_equal
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
 _SKILL_VERSION = "0.1.0"
@@ -114,7 +115,13 @@ def exceedance_probability(ds, variable, dim, threshold, comparison, **kwargs):
         condition_met = comp(da, threshold)
         pct = condition_met.sum(dim=dim) / da.sizes[dim] * 100
         src_units = da.attrs.get("units", "")
-        unit_suffix = f" {src_units}" if src_units and src_units != "1" else ""
+        # Dequantify above restores `units` from the pint Unit's own spelling,
+        # which renders a CF dimensionless "1" as "dimensionless" (not "1") —
+        # a literal "!= '1'" check would miss that and leak "dimensionless"
+        # into the label. units_equal compares pint-equivalence instead of
+        # exact spelling, so both spellings of "no unit" are recognized.
+        is_dimensionless = bool(src_units) and units_equal(src_units, "1")
+        unit_suffix = f" {src_units}" if src_units and not is_dimensionless else ""
         described = da.attrs.get("long_name", var)
         symbol = _COMPARISON_SYMBOLS[comparison]
         label = f"P({described}) {symbol} {threshold}{unit_suffix}"
